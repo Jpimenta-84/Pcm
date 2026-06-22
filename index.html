@@ -354,6 +354,7 @@ header{background:linear-gradient(135deg,var(--blue-grad1),var(--blue-grad2));co
 <div class="toast" id="toast"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
 
 const USUARIOS = {
@@ -377,6 +378,12 @@ const OSS_DATA = [{"tipo":"Parâmetro","numero":405044,"descricao":"Parâmetro -
 
 // ═══ ESTADO ═══
 let dados = JSON.parse(JSON.stringify(OSS_DATA));
+
+// ═══ SUPABASE ═══
+const SUPABASE_URL = 'https://vconuhawmmpjtjkceyxg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_Q5Jbuvs0sr_oIBITFhxEpQ_52f5S_Ug';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+let supabaseDisponivel = true; // cai para modo local se a rede falhar
 let filtrados = [], pag = 1, totPag = 1, modalIdx = null;
 const POR_PAG = 20;
 let perfil = null, usuario = null;
@@ -472,6 +479,7 @@ function entrar(){
   document.getElementById('login-screen').style.display='none';
   document.getElementById('app-screen').style.display='block';
   configApp();
+  sincronizarSupabase();
 }
 function sair(){
   perfil=null; usuario=null;
@@ -929,9 +937,24 @@ function abrirModal(idx){
   document.getElementById('m-body').innerHTML=campos.map(([l,v])=>
     `<div class="drow"><div class="dlbl">${l}</div><div class="dval">${v||'—'}</div></div>`).join('');
   const podeValidar = perfil==='gestor'||perfil==='responsavel'||perfil==='pcm';
+  const jaValidado = o.validacao && o.validacao!=='Pendente' && o.validadoPor && o.validadoPor!==usuario;
   document.getElementById('m-val').style.display=podeValidar?'block':'none';
   document.getElementById('m-obs-field').style.display=podeValidar?'block':'none';
-  document.getElementById('btn-save').style.display=podeValidar?'block':'none';
+  document.getElementById('btn-save').style.display=(podeValidar && !jaValidado)?'block':'none';
+  // Aviso de já validado por outra pessoa
+  const avisoId='m-aviso-validado';
+  let aviso=document.getElementById(avisoId);
+  if(jaValidado){
+    const msg=`🔒 Validado por <b>${o.validadoPor}</b> (${o.validadoPerfil}) em ${o.validadoEm}`;
+    if(!aviso){
+      aviso=document.createElement('div');
+      aviso.id=avisoId;
+      aviso.style.cssText='background:#FEF3C7;border:1px solid #FCD34D;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400E;margin-bottom:10px';
+      document.getElementById('m-val').parentNode.insertBefore(aviso, document.getElementById('m-val'));
+    }
+    aviso.innerHTML=msg;
+    aviso.style.display='block';
+  } else if(aviso){ aviso.style.display='none'; }
   if(podeValidar){
     document.getElementById('m-vbtns').innerHTML=['Concluído','Em Andamento','Cancelado','Pendente']
       .map(v=>`<button class="vbtn ${o.validacao===v?'on':''}" data-v="${v}" onclick="selVal('${v}')">${v}</button>`).join('');
@@ -959,12 +982,33 @@ function toggleExec(v){
   // estrelas aparecem só ao concluir E se for gestor que avalia (José M / Renan F)
   document.getElementById('m-stars').classList.toggle('hidden', !(isConcl && gestorAvalia()));
 }
-function salvarModal(){
+async function salvarModal(){
   if(modalIdx===null) return;
   const ativo=document.querySelector('.vbtn.on');
   if(!ativo){ showToast('Selecione uma validação'); return; }
   const v=ativo.dataset.v;
   const idx=modalIdx;
+
+  // ═══ Anti-duplicação: confere no Supabase se já existe validação antes de gravar ═══
+  if(supabaseDisponivel){
+    try{
+      const {data:existente} = await sb.from('validacoes')
+        .select('validacao,validado_por,validado_perfil,validado_em')
+        .eq('numero_os', dados[idx].numero)
+        .maybeSingle();
+      if(existente && existente.validacao && existente.validacao!=='Pendente'){
+        showToast('Já validado por '+existente.validado_por+' ('+existente.validado_perfil+') em '+existente.validado_em);
+        // sincroniza local com o que já está no banco e fecha
+        dados[idx].validacao=existente.validacao;
+        dados[idx].validadoPor=existente.validado_por;
+        dados[idx].validadoPerfil=existente.validado_perfil;
+        dados[idx].validadoEm=existente.validado_em;
+        fecharModal(); aplicar(); salvarLocal();
+        return;
+      }
+    }catch(e){ /* segue em modo local se a checagem falhar */ }
+  }
+
   if(v==='Concluído'){
     const exec=document.getElementById('m-exec-in').value.trim();
     if(!exec){ showToast('Informe quem executou o serviço'); document.getElementById('m-exec-in').focus(); return; }
@@ -987,11 +1031,58 @@ function salvarModal(){
   dados[idx].validadoPor=usuario;
   dados[idx].validadoPerfil=perfil==='gestor'?'Gestor':perfil==='responsavel'?'Responsável':'PCM';
   dados[idx].validadoEm=new Date().toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});
+
   fecharModal(); aplicar(); salvarLocal();
   showToast('OS '+dados[idx].numero+' validada → '+v);
+
+  // ═══ Grava no Supabase (upsert por numero_os) ═══
+  if(supabaseDisponivel){
+    try{
+      await sb.from('validacoes').upsert({
+        numero_os: dados[idx].numero,
+        validacao: dados[idx].validacao,
+        executado_por: dados[idx].executadoPor||'',
+        satisfacao: dados[idx].satisfacao||0,
+        sugestao_tp_exec: dados[idx].sugestaoTpExec||'',
+        validado_por: dados[idx].validadoPor||'',
+        validado_perfil: dados[idx].validadoPerfil||'',
+        validado_em: dados[idx].validadoEm||'',
+        observacao: dados[idx].observacao||'',
+        atualizado_em: new Date().toISOString()
+      }, { onConflict: 'numero_os' });
+    }catch(e){
+      showToast('Salvo localmente. Sincronização pendente (sem rede).');
+    }
+  }
 }
 function fecharModal(){document.getElementById('modal').classList.remove('open');modalIdx=null;}
 function ovClose(e){if(e.target.id==='modal')fecharModal();}
+
+// ═══ SINCRONIZAÇÃO COM SUPABASE (carrega validações compartilhadas) ═══
+async function sincronizarSupabase(){
+  if(!supabaseDisponivel) return;
+  try{
+    const {data, error} = await sb.from('validacoes').select('*');
+    if(error){ supabaseDisponivel=false; return; }
+    if(!data) return;
+    const porOs = {};
+    data.forEach(r=>porOs[r.numero_os]=r);
+    dados.forEach(o=>{
+      const r = porOs[o.numero];
+      if(r){
+        o.validacao = r.validacao || 'Pendente';
+        o.executadoPor = r.executado_por || '';
+        o.satisfacao = r.satisfacao || 0;
+        o.sugestaoTpExec = r.sugestao_tp_exec || '';
+        o.validadoPor = r.validado_por || '';
+        o.validadoPerfil = r.validado_perfil || '';
+        o.validadoEm = r.validado_em || '';
+        o.observacao = r.observacao || '';
+      }
+    });
+    aplicar(); salvarLocal();
+  }catch(e){ supabaseDisponivel=false; }
+}
 
 // ═══ PERSISTÊNCIA (sessão) ═══
 function salvarLocal(){
